@@ -1,0 +1,26 @@
+name: Hourly Review Processor
+on:
+  schedule:
+    - cron: '0 * * * *'  # Runs automatically every hour
+  workflow_dispatch:      # Adds a "Run" button to GitHub for manual starts
+
+jobs:
+  run-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install openai supabase python-dotenv
+
+      - name: Run Worker
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python processor.py
