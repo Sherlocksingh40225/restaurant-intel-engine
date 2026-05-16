@@ -123,11 +123,10 @@ except FileNotFoundError:
 SYSTEM_PROMPT = f"""You are an elite Restaurant Operations Consultant applying Enlightened Hospitality and TvA Costing frameworks. Your sole source of truth is the Intelligence Core below.
 
 Focus specifically on identifying:
-- Plowhorse Rule violations (high-popularity, margin-eroding dishes)
-- FOH-BOH Disconnects (cold food, modification chaos, expo failures)
-- RevPASH Bottlenecks (scheduling without sales context, omnichannel overload)
-- 51-Percenter Deficits (staff attitude, culture, recovery failures)
-- Supplier Price Drift (untracked ingredient cost creep)
+- Price & Value: Scan for signals like "not worth it". Diagnose issues using terms like "Supplier Price Drift" or "Violating the Plowhorse Rule".
+- Taste & Food Quality: Identify "FOH-BOH Disconnects" for cold food and suggest "Appointing an Expeditor (Expo)" as the fix.
+- Wait Time & Speed: Detect "Omnichannel Overload" and suggest fixes like "RevPASH Optimization" or "Dynamic Throttling".
+- Staff Attitude & Service: Identify signals of rude service and diagnose a lack of "51 percenters".
 
 === INTELLIGENCE CORE ===
 {INTELLIGENCE_CORE}
@@ -138,9 +137,9 @@ You will receive ONE restaurant review. Return ONLY a single raw JSON object. No
 Required keys (all must be present):
 
   "complaint_category"     : Exactly one of: "Price & Value" | "Taste & Food Quality" | "Wait Time & Speed" | "Staff Attitude & Service" | "Positive Reinforcement"
-  "operational_diagnosis"  : The Operational Why from the Intelligence Core (e.g. "FOH-BOH Disconnect", "Chef-Dependent Kitchen", "RevPASH Bottleneck — Scheduling Without Sales Context", "51-Percenter Deficit", "Supplier Price Drift & Margin Blindness", "Positive Reinforcement")
-  "management_fix"         : The exact Management Fix from the Intelligence Core (e.g. "Implement TvA Costing & Menu Engineering", "Appoint Strong Expeditor & Standardize POS", "Optimize RevPASH & Stagger Shifts with KDS Upgrade", "Enforce 5 A's of Mistake Recovery & Prioritize Employee Experience"). Use "N/A" for positive reviews.
-  "recovery_reply"         : A personalized, warm owner response using the 5 A's — Awareness, Acknowledgement, Apology, Action, Additional Generosity. For positive reviews, write a loyalty-reinforcing thank-you.
+  "operational_diagnosis"  : The Operational Why from the Intelligence Core (e.g. "FOH-BOH Disconnect", "Violating the Plowhorse Rule", "RevPASH Bottleneck — Omnichannel Overload", "Lack of 51-percenters", "Supplier Price Drift", "Positive Reinforcement")
+  "management_fix"         : The exact Management Fix from the Intelligence Core (e.g. "Implement TvA Costing & Menu Engineering", "Appoint Strong Expeditor (Expo)", "Optimize RevPASH & Dynamic Throttling", "Prioritize Employee Experience & Hire 51-percenters"). Use "N/A" for positive reviews.
+  "recovery_reply"         : A personalized, non-defensive owner response using the "5 A's of Mistake Recovery" (Awareness, Acknowledgement, Apology, Action, Additional Generosity). Prioritize writing a "great last chapter". For positive reviews, write a loyalty-reinforcing thank-you.
   "strategic_tags"         : JSON array of strings using exact framework terms from the Intelligence Core e.g. ["Plowhorse Rule", "TvA Costing", "RevPASH", "FOH-BOH Disconnect", "51-Percenter", "Supplier Price Drift", "Enlightened Hospitality", "Menu Engineering", "5 A's"]
   "sentiment_metrics"      : JSON object — {{"food": <int 1-10>, "service": <int 1-10>, "value": <int 1-10>, "vibe": <int 1-10>}}
   "urgency_score"          : Integer 1-10. 10 = Local Guide + critical operational failure. 1 = minor positive.
@@ -281,7 +280,7 @@ def fetch_unprocessed(limit: int = FETCH_PAGE_SIZE) -> list[dict]:
         resp = (
             supabase.table("restaurant_reviews")
             .select("id, restaurant_name, reviewer_name, review_text, rating, is_local_guide")
-            .is_("complaint_category", "null")
+            .is_("operational_diagnosis", "null")
             .limit(limit)
             .execute()
         )
@@ -314,7 +313,7 @@ def count_done() -> int:
         resp = (
             supabase.table("restaurant_reviews")
             .select("id", count="exact")
-            .not_.is_("complaint_category", "null")
+            .not_.is_("operational_diagnosis", "null")
             .execute()
         )
         return resp.count or 0
