@@ -149,6 +149,7 @@ OUTPUT RULES — STRICTLY ENFORCED:
 1. Raw JSON object ONLY. Nothing before or after the opening and closing braces.
 2. All string values must be properly JSON-escaped.
 3. Output must be parseable by Python's json.loads() with no preprocessing.
+4. You MUST completely close the JSON object and array before finishing your response. Do not truncate the JSON.
 """
 
 # ── Output Sanitizer ──────────────────────────────────────────────────────────
@@ -220,7 +221,7 @@ async def _call_llm_with_retry(payload: str, semaphore: asyncio.Semaphore) -> li
                             {"role": "user",   "content": payload},
                         ],
                         temperature=0.1,
-                        max_tokens=4000,
+                        max_tokens=8000,
                         timeout=150.0,  # Hardcode Client Timeout
                         response_format={"type": "json_object"}
                     )
@@ -263,10 +264,10 @@ async def _call_llm_with_retry(payload: str, semaphore: asyncio.Semaphore) -> li
                 
     raise BatchFailedError("All models and retries exhausted for batch.")
 
-async def analyze_batch(reviews: list[dict], semaphore: asyncio.Semaphore, batch_size: int = 20) -> list[dict]:
+async def analyze_batch(reviews: list[dict], semaphore: asyncio.Semaphore, batch_size: int = 10) -> list[dict]:
     """
     Process reviews in chunks of `batch_size`.
-    20-10-5 Dynamic Cascade: If batch size 20 fails 3 times, reduce to 10. If 10 fails 3 times, reduce to 5.
+    10-5-2 Dynamic Cascade: If batch size 10 fails 3 times, reduce to 5. If 5 fails, reduce to 2.
     """
     results = []
     i = 0
@@ -285,14 +286,14 @@ async def analyze_batch(reviews: list[dict], semaphore: asyncio.Semaphore, batch
             
         except BatchFailedError:
             # Failed 3 times (the 3 attempts in _call_llm_with_retry)
-            if current_batch_size == 20:
-                current_batch_size = 10
-                log.warning(f"Chunk failed 3 times at size 20. Reducing batch size to 10 and retrying.")
-            elif current_batch_size == 10:
+            if current_batch_size == 10:
                 current_batch_size = 5
                 log.warning(f"Chunk failed 3 times at size 10. Reducing batch size to 5 and retrying.")
+            elif current_batch_size == 5:
+                current_batch_size = 2
+                log.warning(f"Chunk failed 3 times at size 5. Reducing batch size to 2 and retrying.")
             else:
-                log.error(f"Chunk failed 3 times at minimum batch size 5. Skipping chunk.")
+                log.error(f"Chunk failed 3 times at minimum batch size 2. Skipping chunk.")
                 i += len(chunk)
                 current_batch_size = batch_size
                 
@@ -369,7 +370,7 @@ def checkpoint(session_ok: int, session_fail: int, start_ts: float):
 
 async def process_page(reviews: list[dict], semaphore: asyncio.Semaphore) -> tuple[int, int]:
     # Dynamic batch processing
-    results = await analyze_batch(reviews, semaphore, batch_size=20)
+    results = await analyze_batch(reviews, semaphore, batch_size=10)
 
     ok = fail = 0
     
