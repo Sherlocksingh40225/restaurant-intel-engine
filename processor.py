@@ -132,20 +132,21 @@ Focus specifically on identifying:
 {INTELLIGENCE_CORE}
 =========================
 
-You will receive ONE restaurant review. Return ONLY a single raw JSON object. No markdown. No explanation. No preamble. No ```json fences.
+You will receive a JSON array of restaurant reviews. Return a strictly formatted JSON array where each object corresponds to a review. No markdown. No explanation. No preamble. No ```json fences.
 
-Required keys (all must be present):
+Each object MUST contain the following keys:
 
+  "id"                     : The exact ID of the review as provided.
   "complaint_category"     : Exactly one of: "Price & Value" | "Taste & Food Quality" | "Wait Time & Speed" | "Staff Attitude & Service" | "Positive Reinforcement"
-  "operational_diagnosis"  : The Operational Why from the Intelligence Core (e.g. "FOH-BOH Disconnect", "Violating the Plowhorse Rule", "RevPASH Bottleneck — Omnichannel Overload", "Lack of 51-percenters", "Supplier Price Drift", "Positive Reinforcement")
-  "management_fix"         : The exact Management Fix from the Intelligence Core (e.g. "Implement TvA Costing & Menu Engineering", "Appoint Strong Expeditor (Expo)", "Optimize RevPASH & Dynamic Throttling", "Prioritize Employee Experience & Hire 51-percenters"). Use "N/A" for positive reviews.
-  "recovery_reply"         : A personalized, non-defensive owner response using the "5 A's of Mistake Recovery" (Awareness, Acknowledgement, Apology, Action, Additional Generosity). Prioritize writing a "great last chapter". For positive reviews, write a loyalty-reinforcing thank-you.
-  "strategic_tags"         : JSON array of strings using exact framework terms from the Intelligence Core e.g. ["Plowhorse Rule", "TvA Costing", "RevPASH", "FOH-BOH Disconnect", "51-Percenter", "Supplier Price Drift", "Enlightened Hospitality", "Menu Engineering", "5 A's"]
+  "operational_diagnosis"  : The Operational Why from the Intelligence Core.
+  "management_fix"         : The exact Management Fix from the Intelligence Core. Use "N/A" for positive reviews.
+  "recovery_reply"         : A personalized, non-defensive owner response using the "5 A's of Mistake Recovery".
+  "strategic_tags"         : JSON array of strings using exact framework terms from the Intelligence Core.
   "sentiment_metrics"      : JSON object — {{"food": <int 1-10>, "service": <int 1-10>, "value": <int 1-10>, "vibe": <int 1-10>}}
   "urgency_score"          : Integer 1-10. 10 = Local Guide + critical operational failure. 1 = minor positive.
 
 OUTPUT RULES — STRICTLY ENFORCED:
-1. Raw JSON object ONLY. Nothing before or after the opening and closing braces.
+1. Raw JSON array ONLY. Nothing before or after the opening and closing brackets.
 2. All string values must be properly JSON-escaped.
 3. Output must be parseable by Python's json.loads() with no preprocessing.
 """
@@ -195,32 +196,21 @@ def validate_result(raw: dict) -> dict:
     return raw
 
 
-# ── Single-Review API Call ────────────────────────────────────────────────────
+# ── Batch API Call & Resilience ───────────────────────────────────────────────
 
-async def analyze_one(review: dict, semaphore: asyncio.Semaphore) -> dict | None:
-    """
-    Analyze one review walking MODEL_CHAIN (pro → flash → micro).
-    Any 429 RateLimitError triggers an immediate RATE_429_SLEEP before
-    stepping down to the next lighter model in the chain.
-    Returns validated result dict or None if entire chain is exhausted.
-    """
-    rid = review.get("id", "?")
-    payload = (
-        f"Review ID     : {rid}\n"
-        f"Restaurant    : {review.get('restaurant_name', '')}\n"
-        f"Reviewer      : {review.get('reviewer_name', '')} "
-        f"({'Local Guide' if review.get('is_local_guide') else 'Regular'})\n"
-        f"Rating        : {review.get('rating', 'N/A')} / 5 stars\n"
-        f"Review Text   : {(review.get('review_text') or '').strip()}"
-    )
+class BatchFailedError(Exception):
+    pass
 
+async def _call_llm_with_retry(payload: str, semaphore: asyncio.Semaphore) -> list:
+    """Wrapper to call LLM with simple exponential backoff on 429s/timeouts."""
     async with semaphore:
-        for model_idx, model in enumerate(MODEL_CHAIN):
-            model_label = model.split("/")[-1]   # short name for logs
-            for attempt, delay in enumerate(RETRY_DELAYS, start=1):
+        for model in MODEL_CHAIN:
+            model_label = model.split("/")[-1]
+            # Exponential backoff (2s, 4s, 8s)
+            for attempt, delay in enumerate([2, 4, 8], start=1):
                 await rate_limiter.acquire()
                 try:
-                    log.debug(f"  [{rid}] {model_label} attempt {attempt}...")
+                    log.debug(f"  [Batch] {model_label} attempt {attempt}...")
                     resp = await nvidia_client.chat.completions.create(
                         model=model,
                         messages=[
@@ -228,50 +218,70 @@ async def analyze_one(review: dict, semaphore: asyncio.Semaphore) -> dict | None
                             {"role": "user",   "content": payload},
                         ],
                         temperature=0.1,
-                        max_tokens=1200,
+                        max_tokens=4000,
                     )
                     raw_text = resp.choices[0].message.content
                     clean    = clean_output(raw_text)
                     parsed   = json.loads(clean)
 
-                    if not isinstance(parsed, dict):
-                        raise ValueError(f"Expected dict, got {type(parsed).__name__}")
+                    if not isinstance(parsed, list):
+                        raise ValueError(f"Expected list, got {type(parsed).__name__}")
 
-                    log.debug(f"  [{rid}] Success via {model_label}.")
-                    return validate_result(parsed)
+                    log.debug(f"  [Batch] Success via {model_label}.")
+                    return [validate_result(r) for r in parsed if isinstance(r, dict)]
 
-                except RateLimitError as e:
-                    # 429 — sleep 60s immediately, then step to lighter model
-                    log.warning(
-                        f"  [{rid}] 429 on {model_label} (attempt {attempt}). "
-                        f"Sleeping {RATE_429_SLEEP}s then stepping down model..."
-                    )
-                    await asyncio.sleep(RATE_429_SLEEP)
-                    break   # exit inner retry loop → next model in chain
-
-                except (APITimeoutError, APIConnectionError) as e:
-                    log.warning(f"  [{rid}] {model_label} attempt {attempt} timeout/conn: {e}")
-
+                except (RateLimitError, APITimeoutError, APIConnectionError) as e:
+                    log.warning(f"  [Batch] {model_label} attempt {attempt} network/rate error: {e}")
                 except json.JSONDecodeError as e:
-                    snippet = clean[:200] if "clean" in dir() else "<no output>"
-                    log.error(f"  [{rid}] {model_label} attempt {attempt} JSON error: {e} | {snippet}")
-
+                    snippet = clean[:200] if "clean" in locals() else "<no output>"
+                    log.error(f"  [Batch] {model_label} attempt {attempt} JSON error: {e} | {snippet}")
                 except Exception as e:
-                    log.error(f"  [{rid}] {model_label} attempt {attempt} {type(e).__name__}: {e}")
+                    log.error(f"  [Batch] {model_label} attempt {attempt} error: {type(e).__name__}: {e}")
 
-                # Backoff before next retry on the same model
-                if attempt < len(RETRY_DELAYS):
-                    log.info(f"  [{rid}] Backing off {delay}s...")
-                    await asyncio.sleep(delay)
+                log.info(f"  [Batch] Backing off {delay}s...")
+                await asyncio.sleep(delay)
+                
+            log.warning(f"  [Batch] {model_label} exhausted.")
+    raise BatchFailedError("All models and retries exhausted for batch.")
 
-            # All retries on this model used up (non-429 failures)
-            if model_idx < len(MODEL_CHAIN) - 1:
-                next_model = MODEL_CHAIN[model_idx + 1].split("/")[-1]
-                log.warning(f"  [{rid}] {model_label} exhausted. Stepping to {next_model}...")
-
-    log.error(f"  [{rid}] Entire model chain exhausted. Skipping row.")
-    return None
-
+async def analyze_batch(reviews: list[dict], semaphore: asyncio.Semaphore, batch_size: int = 20) -> list[dict]:
+    """
+    Process reviews in chunks of `batch_size`.
+    If a chunk fails 3 times, divide batch size by 2 and retry.
+    """
+    results = []
+    i = 0
+    current_batch_size = batch_size
+    while i < len(reviews):
+        chunk = reviews[i:i + current_batch_size]
+        payload = json.dumps(chunk, ensure_ascii=False, indent=2)
+        
+        success = False
+        for attempt in range(1, 4):
+            log.info(f"Processing chunk {i}-{i+len(chunk)} (size {current_batch_size}, attempt {attempt})...")
+            try:
+                chunk_results = await _call_llm_with_retry(payload, semaphore)
+                results.extend(chunk_results)
+                success = True
+                break
+            except Exception as e:
+                log.warning(f"Chunk attempt {attempt} failed: {e}")
+                
+        if not success:
+            if current_batch_size > 5:
+                current_batch_size = max(5, current_batch_size // 2)
+                log.warning(f"Chunk failed 3 times. Reducing batch size to {current_batch_size} and retrying.")
+                continue
+            else:
+                log.error(f"Chunk failed 3 times at minimum batch size 5. Skipping chunk.")
+                i += len(chunk)
+                current_batch_size = batch_size
+                continue
+                
+        i += len(chunk)
+        current_batch_size = batch_size
+        
+    return results
 
 # ── Database Helpers ──────────────────────────────────────────────────────────
 
@@ -343,12 +353,17 @@ def checkpoint(session_ok: int, session_fail: int, start_ts: float):
 # ── Concurrent Page Processor ─────────────────────────────────────────────────
 
 async def process_page(reviews: list[dict], semaphore: asyncio.Semaphore) -> tuple[int, int]:
-    tasks   = [analyze_one(r, semaphore) for r in reviews]
-    results = await asyncio.gather(*tasks)
+    # Dynamic batch processing
+    results = await analyze_batch(reviews, semaphore, batch_size=20)
 
     ok = fail = 0
-    for review, result in zip(reviews, results):
-        if result and write_to_db(review["id"], result):
+    
+    # Map results by id
+    result_map = {str(r.get("id")): r for r in results if r.get("id")}
+    
+    for review in reviews:
+        rid = str(review.get("id"))
+        if rid in result_map and write_to_db(review["id"], result_map[rid]):
             ok += 1
         else:
             fail += 1
