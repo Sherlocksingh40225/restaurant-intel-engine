@@ -198,16 +198,18 @@ def validate_result(raw: dict) -> dict:
 
 # ── Batch API Call & Resilience ───────────────────────────────────────────────
 
+import httpx
+import requests
+
 class BatchFailedError(Exception):
     pass
 
 async def _call_llm_with_retry(payload: str, semaphore: asyncio.Semaphore) -> list:
-    """Wrapper to call LLM with simple exponential backoff on 429s/timeouts."""
+    """Wrapper to call LLM with fallback and exponential backoff."""
     async with semaphore:
-        for model in MODEL_CHAIN:
-            model_label = model.split("/")[-1]
-            # Exponential backoff (2s, 4s, 8s)
-            for attempt, delay in enumerate([2, 4, 8], start=1):
+        for attempt, delay in enumerate([2, 4, 8], start=1):
+            for model in MODEL_CHAIN:
+                model_label = model.split("/")[-1]
                 await rate_limiter.acquire()
                 try:
                     log.debug(f"  [Batch] {model_label} attempt {attempt}...")
@@ -219,6 +221,7 @@ async def _call_llm_with_retry(payload: str, semaphore: asyncio.Semaphore) -> li
                         ],
                         temperature=0.1,
                         max_tokens=4000,
+                        timeout=150.0  # Hardcode Client Timeout
                     )
                     raw_text = resp.choices[0].message.content
                     clean    = clean_output(raw_text)
@@ -230,24 +233,29 @@ async def _call_llm_with_retry(payload: str, semaphore: asyncio.Semaphore) -> li
                     log.debug(f"  [Batch] Success via {model_label}.")
                     return [validate_result(r) for r in parsed if isinstance(r, dict)]
 
-                except (RateLimitError, APITimeoutError, APIConnectionError) as e:
-                    log.warning(f"  [Batch] {model_label} attempt {attempt} network/rate error: {e}")
+                except (RateLimitError, APITimeoutError, APIConnectionError, TimeoutError, httpx.ReadTimeout, httpx.ConnectTimeout, requests.exceptions.Timeout) as e:
+                    # Treat Timeout exactly like 429: immediately trigger fallback
+                    log.warning(f"  [Batch] {model_label} attempt {attempt} hit 429/Timeout: {type(e).__name__}. Triggering fallback...")
+                    continue
                 except json.JSONDecodeError as e:
                     snippet = clean[:200] if "clean" in locals() else "<no output>"
                     log.error(f"  [Batch] {model_label} attempt {attempt} JSON error: {e} | {snippet}")
+                    continue
                 except Exception as e:
                     log.error(f"  [Batch] {model_label} attempt {attempt} error: {type(e).__name__}: {e}")
-
-                log.info(f"  [Batch] Backing off {delay}s...")
+                    continue
+            
+            # If all models in the chain failed for this attempt, apply exponential backoff
+            if attempt < 3:
+                log.info(f"  [Batch] All models exhausted for attempt {attempt}. Backing off {delay}s...")
                 await asyncio.sleep(delay)
                 
-            log.warning(f"  [Batch] {model_label} exhausted.")
     raise BatchFailedError("All models and retries exhausted for batch.")
 
 async def analyze_batch(reviews: list[dict], semaphore: asyncio.Semaphore, batch_size: int = 20) -> list[dict]:
     """
     Process reviews in chunks of `batch_size`.
-    If a chunk fails 3 times, divide batch size by 2 and retry.
+    20-10-5 Dynamic Cascade: If batch size 20 fails 3 times, reduce to 10. If 10 fails 3 times, reduce to 5.
     """
     results = []
     i = 0
@@ -256,31 +264,27 @@ async def analyze_batch(reviews: list[dict], semaphore: asyncio.Semaphore, batch
         chunk = reviews[i:i + current_batch_size]
         payload = json.dumps(chunk, ensure_ascii=False, indent=2)
         
-        success = False
-        for attempt in range(1, 4):
-            log.info(f"Processing chunk {i}-{i+len(chunk)} (size {current_batch_size}, attempt {attempt})...")
-            try:
-                chunk_results = await _call_llm_with_retry(payload, semaphore)
-                results.extend(chunk_results)
-                success = True
-                break
-            except Exception as e:
-                log.warning(f"Chunk attempt {attempt} failed: {e}")
-                
-        if not success:
-            if current_batch_size > 5:
-                current_batch_size = max(5, current_batch_size // 2)
-                log.warning(f"Chunk failed 3 times. Reducing batch size to {current_batch_size} and retrying.")
-                continue
+        log.info(f"Processing chunk {i}-{i+len(chunk)} (size {current_batch_size})...")
+        try:
+            # _call_llm_with_retry does 3 attempts internally
+            chunk_results = await _call_llm_with_retry(payload, semaphore)
+            results.extend(chunk_results)
+            i += len(chunk)
+            current_batch_size = batch_size # Reset on success
+            
+        except BatchFailedError:
+            # Failed 3 times (the 3 attempts in _call_llm_with_retry)
+            if current_batch_size == 20:
+                current_batch_size = 10
+                log.warning(f"Chunk failed 3 times at size 20. Reducing batch size to 10 and retrying.")
+            elif current_batch_size == 10:
+                current_batch_size = 5
+                log.warning(f"Chunk failed 3 times at size 10. Reducing batch size to 5 and retrying.")
             else:
                 log.error(f"Chunk failed 3 times at minimum batch size 5. Skipping chunk.")
                 i += len(chunk)
                 current_batch_size = batch_size
-                continue
                 
-        i += len(chunk)
-        current_batch_size = batch_size
-        
     return results
 
 # ── Database Helpers ──────────────────────────────────────────────────────────
