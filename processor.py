@@ -1,7 +1,7 @@
 """
 processor.py — Autonomous Review Intelligence Worker  v4.3  (Cloud-Optimized)
 ──────────────────────────────────────────────────────────────────────────────
-  • Primary model  : deepseek-ai/deepseek-v4-flash  (5x faster, stable)
+  • Primary model  : meta/llama-3.3-70b-instruct
   • Fallback       : meta/llama-3.1-8b-instruct
   • Base URL       : https://integrate.api.nvidia.com/v1
   • Concurrency    : asyncio + Semaphore(3)
@@ -42,7 +42,7 @@ for handler in [
 
 # ── Config ────────────────────────────────────────────────────────────────────
 # Model chain: flash as primary (stable + fast), micro as emergency fallback
-MODEL_PRIMARY    = "deepseek-ai/deepseek-v4-flash"   # 5x faster, high stability
+MODEL_PRIMARY    = "meta/llama-3.3-70b-instruct"
 MODEL_MICRO      = "meta/llama-3.1-8b-instruct"      # near-zero 429 risk
 MODEL_CHAIN      = [MODEL_PRIMARY, MODEL_MICRO]
 BASE_URL         = "https://integrate.api.nvidia.com/v1"
@@ -132,7 +132,7 @@ Focus specifically on identifying:
 {INTELLIGENCE_CORE}
 =========================
 
-You will receive a JSON array of restaurant reviews. Return a strictly formatted JSON array where each object corresponds to a review. No markdown. No explanation. No preamble. No ```json fences.
+You will receive a JSON array of restaurant reviews. You must return a valid JSON object containing an array of reviews under the key "reviews". No markdown. No explanation. No preamble. No ```json fences.
 
 Each object MUST contain the following keys:
 
@@ -146,7 +146,7 @@ Each object MUST contain the following keys:
   "urgency_score"          : Integer 1-10. 10 = Local Guide + critical operational failure. 1 = minor positive.
 
 OUTPUT RULES — STRICTLY ENFORCED:
-1. Raw JSON array ONLY. Nothing before or after the opening and closing brackets.
+1. Raw JSON object ONLY. Nothing before or after the opening and closing braces.
 2. All string values must be properly JSON-escaped.
 3. Output must be parseable by Python's json.loads() with no preprocessing.
 """
@@ -155,7 +155,7 @@ OUTPUT RULES — STRICTLY ENFORCED:
 
 def clean_output(text: str) -> str:
     """Strip <think> blocks, markdown fences, and leading/trailing whitespace."""
-    # Remove DeepSeek internal reasoning blocks
+    # Remove internal reasoning blocks
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     # Remove markdown fences
     text = re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=re.IGNORECASE)
@@ -221,11 +221,22 @@ async def _call_llm_with_retry(payload: str, semaphore: asyncio.Semaphore) -> li
                         ],
                         temperature=0.1,
                         max_tokens=4000,
-                        timeout=150.0  # Hardcode Client Timeout
+                        timeout=150.0,  # Hardcode Client Timeout
+                        response_format={"type": "json_object"}
                     )
                     raw_text = resp.choices[0].message.content
                     clean    = clean_output(raw_text)
                     parsed   = json.loads(clean)
+
+                    # Extract array if wrapped in object
+                    if isinstance(parsed, dict):
+                        if "reviews" in parsed:
+                            parsed = parsed["reviews"]
+                        else:
+                            for k, v in parsed.items():
+                                if isinstance(v, list):
+                                    parsed = v
+                                    break
 
                     if not isinstance(parsed, list):
                         raise ValueError(f"Expected list, got {type(parsed).__name__}")
