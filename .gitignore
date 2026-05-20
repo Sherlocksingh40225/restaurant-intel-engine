@@ -1,1 +1,48 @@
+# Environments and secrets
 .env
+.env.*
+backfill_reviews.py
+
+# Logs
+*.log
+pipeline.log
+scraper.log
+
+# Screenshots and captchas
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Scratch and test files containing potential credentials/keys
+fetch_all_stitch.py
+get_screens_data.py
+run_mcp_client.py
+run_mcp_help.py
+test_*.py
+test_*.js
+debug_*.py
+enable_stitch_*.py
+find_stitch_*.py
+get_node_error.py
+list_gcp_projects.py
+read_config.py
+query_stats.py
+download.py
+dump_buttons.py
+extract.py
+mcp_config_dump*.json
+fetched_raw_data.json
+current_search_results.txt
+subagent_transcript.txt
+text.txt
+
+# Local temporary assets/folders
+stitch_assets/
+free-claude-code/
