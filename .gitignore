@@ -14,6 +14,11 @@ scraper.log
 *.jpeg
 *.gif
 
+# HTML Files
+*.html
+page.html
+review_page.html
+
 # Python cache
 __pycache__/
 *.pyc
@@ -42,6 +47,8 @@ fetched_raw_data.json
 current_search_results.txt
 subagent_transcript.txt
 text.txt
+debug_output.txt
+review_texts.txt
 
 # Local temporary assets/folders
 stitch_assets/

@@ -1,2 +1,0 @@
-Inputs:
-id: ucc-1, name: q, class: UGojuc fontBodyMedium EmSKud lpggsf , type: 
