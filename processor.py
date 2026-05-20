@@ -22,11 +22,15 @@ import json
 import asyncio
 import logging
 import sys
+import io
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from openai import AsyncOpenAI, APITimeoutError, APIConnectionError, RateLimitError
+
+# Reconfigure stdout to use UTF-8 to prevent Windows terminal character mapping errors
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", line_buffering=True)
 
 # ── Dual Logging ──────────────────────────────────────────────────────────────
 log = logging.getLogger("pipeline")
@@ -305,7 +309,7 @@ def fetch_unprocessed(limit: int = FETCH_PAGE_SIZE) -> list[dict]:
     try:
         resp = (
             supabase.table("restaurant_reviews")
-            .select("id, restaurant_name, reviewer_name, review_text, rating, is_local_guide")
+            .select("id, restaurant_name, reviewer_name, review_text, rating, is_local_guide, scraped_at")
             .is_("operational_diagnosis", "null")
             .limit(limit)
             .execute()
@@ -368,6 +372,62 @@ def checkpoint(session_ok: int, session_fail: int, start_ts: float):
 
 # ── Concurrent Page Processor ─────────────────────────────────────────────────
 
+def compute_operational_tags(current_review_id: str, complaint_category: str, rating: float, urgency_score: int, scraped_at: str, history: list[dict]) -> list[str]:
+    """
+    Calculates SLA_BREACH, REPEAT_ISSUE, and TREND_ACCELERATION in Python using pre-fetched history.
+    Strictly filters out current_review_id from history comparisons to prevent self-matching.
+    """
+    new_tags = []
+    
+    # 1. SLA Breach Detection
+    if scraped_at:
+        try:
+            sa_parsed = datetime.fromisoformat(scraped_at.replace("Z", "+00:00"))
+            now = datetime.now(timezone.utc)
+            elapsed_hours = (now - sa_parsed).total_seconds() / 3600.0
+            
+            sla_threshold = 48
+            if urgency_score >= 8:
+                sla_threshold = 12
+            elif urgency_score >= 6:
+                sla_threshold = 24
+                
+            if elapsed_hours > sla_threshold:
+                new_tags.append("SLA_BREACH")
+        except Exception as e:
+            log.warning(f"  [SLA Check] Error parsing scraped_at '{scraped_at}': {e}")
+            
+    # Apply Repeat Issue Clustering (same category, size >= 2 including current review)
+    if complaint_category and complaint_category != "Positive Reinforcement":
+        other_same_cat = [
+            h for h in history 
+            if h.get("id") != current_review_id and h.get("complaint_category") == complaint_category
+        ]
+        if len(other_same_cat) >= 1:
+            new_tags.append("REPEAT_ISSUE")
+            
+    # Apply Trend Velocity Detection (24h vs 7d average rating drop >= 0.5)
+    try:
+        twenty_four_hours_ago = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        recent_ratings = [
+            float(h["rating"]) for h in history 
+            if h.get("scraped_at") and h["scraped_at"] >= twenty_four_hours_ago and h.get("rating") is not None
+        ]
+        base_ratings = [
+            float(h["rating"]) for h in history 
+            if h.get("rating") is not None
+        ]
+        
+        if len(recent_ratings) >= 2 and len(base_ratings) >= 3:
+            avg_recent = sum(recent_ratings) / len(recent_ratings)
+            avg_base = sum(base_ratings) / len(base_ratings)
+            if avg_recent <= avg_base - 0.5:
+                new_tags.append("TREND_ACCELERATION")
+    except Exception as e:
+        log.warning(f"  [Trend Velocity] Calculation error: {e}")
+        
+    return new_tags
+
 async def process_page(reviews: list[dict], semaphore: asyncio.Semaphore) -> tuple[int, int]:
     # Dynamic batch processing
     results = await analyze_batch(reviews, semaphore, batch_size=10)
@@ -377,10 +437,69 @@ async def process_page(reviews: list[dict], semaphore: asyncio.Semaphore) -> tup
     # Map results by id
     result_map = {str(r.get("id")): r for r in results if r.get("id")}
     
+    # ── Pre-fetch 7-day history in ONE query to eliminate N+1 latency ──────────
+    history_map = {}
+    restaurant_names = list({r.get("restaurant_name") for r in reviews if r.get("restaurant_name")})
+    if restaurant_names:
+        try:
+            seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+            resp = supabase.table("restaurant_reviews") \
+                .select("id, scraped_at, rating, complaint_category, restaurant_name") \
+                .in_("restaurant_name", restaurant_names) \
+                .gte("scraped_at", seven_days_ago) \
+                .execute()
+            all_history = resp.data or []
+            
+            # Group in memory by restaurant_name
+            for h in all_history:
+                rname = h.get("restaurant_name")
+                if rname:
+                    history_map.setdefault(rname, []).append(h)
+        except Exception as e:
+            log.warning(f"  [History Pre-fetch] Error querying history: {e}")
+            
     for review in reviews:
         rid = str(review.get("id"))
-        if rid in result_map and write_to_db(review["id"], result_map[rid]):
-            ok += 1
+        if rid in result_map:
+            res = result_map[rid]
+            
+            # Extract current values for operational computations
+            restaurant_name = review.get("restaurant_name")
+            complaint_category = res.get("complaint_category")
+            try:
+                rating = float(review.get("rating") or 5.0)
+            except (TypeError, ValueError):
+                rating = 5.0
+            urgency_score = int(res.get("urgency_score") or 5)
+            scraped_at = review.get("scraped_at")
+            
+            # Extract this restaurant's history from pre-fetched map
+            restaurant_history = history_map.get(restaurant_name, []) if restaurant_name else []
+            
+            # Compute SLA, Repeat, and Velocity operational tags using in-memory history
+            op_tags = compute_operational_tags(
+                current_review_id=review["id"],
+                complaint_category=complaint_category,
+                rating=rating,
+                urgency_score=urgency_score,
+                scraped_at=scraped_at,
+                history=restaurant_history
+            )
+            
+            # Securely merge new unique operational tags into strategic_tags
+            existing_tags = res.get("strategic_tags", [])
+            if not isinstance(existing_tags, list):
+                existing_tags = []
+            
+            # Filter out existing SLA_BREACH/REPEAT_ISSUE/TREND_ACCELERATION to avoid duplicates,
+            # then add current ones back
+            cleaned_tags = [t for t in existing_tags if t not in ("SLA_BREACH", "REPEAT_ISSUE", "TREND_ACCELERATION")]
+            res["strategic_tags"] = list(set(cleaned_tags + op_tags))
+            
+            if write_to_db(review["id"], res):
+                ok += 1
+            else:
+                fail += 1
         else:
             fail += 1
 
