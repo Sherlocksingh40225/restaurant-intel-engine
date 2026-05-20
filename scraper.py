@@ -11,7 +11,7 @@ Features:
   • headless=True + realistic User-Agent
   • Random 2–4 s delay between restaurants (bot-evasion)
   • Fault-tolerant: failed restaurants are logged & skipped
-  • Supabase upsert on (restaurant_name, reviewer_name, review_text)
+  • Supabase upsert on (restaurant_name, reviewer_name, google_review_id)
 """
 
 import os
