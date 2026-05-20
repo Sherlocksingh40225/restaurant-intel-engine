@@ -943,6 +943,7 @@ async def scrape_query(page, search_query: str, city: str,
                 # strategic_tags, urgency_score, recovery_reply) are
                 # left untouched by Supabase on conflict — they are
                 # never overwritten by the scraper.
+                print("UPSERT TARGET: restaurant_name,reviewer_name,google_review_id")
                 supabase.table("restaurant_reviews").upsert(
                     record,
                     on_conflict="restaurant_name,reviewer_name,google_review_id"

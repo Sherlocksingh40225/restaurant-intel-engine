@@ -322,6 +322,7 @@ def fetch_unprocessed(limit: int = FETCH_PAGE_SIZE) -> list[dict]:
 
 def write_to_db(review_id, result: dict) -> bool:
     try:
+        print("UPSERT TARGET: primary_key (id)")
         supabase.table("restaurant_reviews").upsert({
             "id":                    review_id,
             "complaint_category":    result["complaint_category"],
