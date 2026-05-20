@@ -936,6 +936,7 @@ async def scrape_query(page, search_query: str, city: str,
                 "scraped_at":         datetime.now(timezone.utc).isoformat(),
             }
 
+            conflict_target = "restaurant_name,reviewer_name,google_review_id"
             try:
                 # upsert on the stable unique key:
                 # (restaurant_name, reviewer_name, google_review_id).
@@ -943,10 +944,10 @@ async def scrape_query(page, search_query: str, city: str,
                 # strategic_tags, urgency_score, recovery_reply) are
                 # left untouched by Supabase on conflict — they are
                 # never overwritten by the scraper.
-                print("UPSERT TARGET: restaurant_name,reviewer_name,google_review_id")
+                print(f"UPSERT TARGET: {conflict_target}")
                 supabase.table("restaurant_reviews").upsert(
                     record,
-                    on_conflict="restaurant_name,reviewer_name,google_review_id"
+                    on_conflict=conflict_target
                 ).execute()
                 totals["db_ok"] += 1
             except Exception as db_err:
